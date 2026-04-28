@@ -5,7 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>HuntBot — Logic Navigation System</title>
-  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <link rel="icon" type="image/png" href="static/favicon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link
     href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Bebas+Neue&family=Outfit:wght@300;400;500;600&display=swap"
@@ -1232,7 +1232,7 @@
   <!-- Start Screen Overlay -->
   <div id="start-screen">
     <div class="start-content">
-      <img src="/static/favicon.png" alt="HuntBot Logo" class="start-icon">
+      <img src="static/favicon.png" alt="HuntBot Logo" class="start-icon">
       <h1 class="start-title">HUNTBOT:<br><span>THE WUMPUS GAME</span></h1>
       <p class="start-desc">An AI agent navigating a logic-based dungeon with partial observability.</p>
       
@@ -1433,9 +1433,465 @@
   </div>
   <script>
     let STATE = null, autoTimer = null, isAuto = false;
-    const MAX_CLAUSES = 500;
-    async function apiInit() { const r = +document.getElementById('rows').value, c = +document.getElementById('cols').value, p = +document.getElementById('pits').value; const res = await fetch('/init', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rows: r, cols: c, pits: p }) }); return res.json(); }
-    async function apiStep() { const res = await fetch('/step', { method: 'POST', headers: { 'Content-Type': 'application/json' } }); return res.json(); }
+    const MAX_CLAUSES = 700;
+    
+// --- PYTHON BACKEND LOGIC PORTED TO JS ---
+
+function key(r, c) { return `${r},${c}`; }
+function unkey(k) { const p = k.split(","); return [parseInt(p[0], 10), parseInt(p[1], 10)]; }
+function in_bounds(r, c, rows, cols) { return r >= 0 && r < rows && c >= 0 && c < cols; }
+function neighbors(r, c, rows, cols) {
+    const n = [];
+    const dirs = [[r-1,c], [r+1,c], [r,c-1], [r,c+1]];
+    for (let [nr, nc] of dirs) {
+        if (in_bounds(nr, nc, rows, cols)) n.push([nr, nc]);
+    }
+    return n;
+}
+
+function neg_lit(lit) { return lit.startsWith("~") ? lit.substring(1) : "~" + lit; }
+
+function union(setA, setB) {
+    let _union = new Set(setA);
+    for (let elem of setB) _union.add(elem);
+    return _union;
+}
+
+function resolve(c1, c2) {
+    const s1 = new Set(c1);
+    const s2 = new Set(c2);
+    for (let lit of s1) {
+        const neg = neg_lit(lit);
+        if (s2.has(neg)) {
+            const resolvent = union(s1, s2);
+            resolvent.delete(lit);
+            resolvent.delete(neg);
+            let is_tautology = false;
+            for (let l of resolvent) {
+                if (resolvent.has(neg_lit(l))) {
+                    is_tautology = true;
+                    break;
+                }
+            }
+            if (!is_tautology) return Array.from(resolvent);
+        }
+    }
+    return null;
+}
+
+function resolution_refutation(alpha, clauses) {
+    const clause_set = clauses.map(c => new Set(c));
+    clause_set.push(new Set([neg_lit(alpha)]));
+    const seen = new Set();
+    let changed = true;
+    while (changed) {
+        changed = false;
+        const n = clause_set.length;
+        if (n > MAX_CLAUSES) break;
+        for (let i = 0; i < n; i++) {
+            for (let j = i + 1; j < n; j++) {
+                const resolvent = resolve(Array.from(clause_set[i]), Array.from(clause_set[j]));
+                if (resolvent === null) continue;
+                if (resolvent.length === 0) return true;
+                resolvent.sort();
+                const sk = resolvent.join("|");
+                if (!seen.has(sk)) {
+                    seen.add(sk);
+                    clause_set.push(new Set(resolvent));
+                    changed = true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+function build_world(rows, cols, num_pits) {
+    const cells = {};
+    const all_cells = [];
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            cells[key(r,c)] = { wumpus: false, pit: false, gold: false, stench: false, breeze: false, glitter: false };
+            all_cells.push(key(r,c));
+        }
+    }
+
+    const wumpus_candidates = all_cells.filter(k => k !== key(0,0));
+    const wumpus_key = wumpus_candidates[Math.floor(Math.random() * wumpus_candidates.length)];
+    cells[wumpus_key].wumpus = true;
+
+    const max_allowed_pits = Math.max(1, Math.floor((rows * cols) / 3));
+    num_pits = Math.min(num_pits, max_allowed_pits);
+
+    let pit_candidates = all_cells.filter(k => k !== key(0,0) && k !== wumpus_key);
+    num_pits = Math.min(num_pits, pit_candidates.length);
+    const pit_keys = [];
+    for (let i = 0; i < num_pits; i++) {
+        const idx = Math.floor(Math.random() * pit_candidates.length);
+        const pk = pit_candidates.splice(idx, 1)[0];
+        pit_keys.push(pk);
+        cells[pk].pit = true;
+    }
+
+    let gold_candidates = all_cells.filter(k => !cells[k].pit && !cells[k].wumpus);
+    let gold_key = key(0,0);
+    if (gold_candidates.length > 0) {
+        gold_key = gold_candidates[Math.floor(Math.random() * gold_candidates.length)];
+    }
+    cells[gold_key].gold = true;
+    cells[gold_key].glitter = true;
+
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            for (let [nr, nc] of neighbors(r, c, rows, cols)) {
+                if (cells[key(nr, nc)].wumpus) cells[key(r, c)].stench = true;
+                if (cells[key(nr, nc)].pit) cells[key(r, c)].breeze = true;
+            }
+        }
+    }
+
+    return { cells, wumpus_key, pit_keys, gold_key };
+}
+
+function make_fresh_state(rows, cols, num_pits) {
+    const { cells, wumpus_key, pit_keys, gold_key } = build_world(rows, cols, num_pits);
+    return {
+        rows, cols, cells,
+        agent: { r: 0, c: 0, alive: true, has_gold: false, has_arrow: true },
+        kb: {
+            safe: [key(0,0)],
+            not_wumpus: [key(0,0)],
+            not_pit: [key(0,0)],
+            visited: [],
+            wumpus_confirmed: [],
+            pit_confirmed: [],
+            stenches: [],
+            breezes: [],
+            clauses: [["SAFE(0,0)"], ["~WUMPUS(0,0)"], ["~PIT(0,0)"]],
+            resolved_log: []
+        },
+        wumpus_alive: true, wumpus_key, pit_keys, gold_key,
+        gold_found: false, score: 0, steps: 0, game_over: false,
+        result: null, log: [], initialized: true
+    };
+}
+
+function add_clause(kb, literals) {
+    literals.sort();
+    const s = literals.join("|");
+    const existing = new Set(kb.clauses.map(c => [...c].sort().join("|")));
+    if (!existing.has(s)) {
+        kb.clauses.push(literals);
+    }
+}
+
+function encode_percepts(state, r, c) {
+    const kb = state.kb;
+    const { rows, cols } = state;
+    const cell = state.cells[key(r, c)];
+    const nbrs = neighbors(r, c, rows, cols);
+
+    if (cell.stench) {
+        if (!kb.stenches.includes(key(r,c))) kb.stenches.push(key(r,c));
+        const wumpus_lits = nbrs.map(([nr, nc]) => `WUMPUS(${nr},${nc})`);
+        add_clause(kb, wumpus_lits);
+    } else {
+        for (let [nr, nc] of nbrs) {
+            add_clause(kb, [`~WUMPUS(${nr},${nc})`]);
+            if (!kb.not_wumpus.includes(key(nr,nc))) kb.not_wumpus.push(key(nr,nc));
+        }
+    }
+
+    if (cell.breeze) {
+        if (!kb.breezes.includes(key(r,c))) kb.breezes.push(key(r,c));
+        const pit_lits = nbrs.map(([nr, nc]) => `PIT(${nr},${nc})`);
+        add_clause(kb, pit_lits);
+    } else {
+        for (let [nr, nc] of nbrs) {
+            add_clause(kb, [`~PIT(${nr},${nc})`]);
+            if (!kb.not_pit.includes(key(nr,nc))) kb.not_pit.push(key(nr,nc));
+        }
+    }
+}
+
+function prove_cell(state, r, c) {
+    const kb = state.kb;
+    const k = key(r, c);
+    if (kb.safe.includes(k)) return;
+
+    const not_w = kb.not_wumpus.includes(k) || resolution_refutation(`~WUMPUS(${r},${c})`, kb.clauses);
+    const not_p = kb.not_pit.includes(k) || resolution_refutation(`~PIT(${r},${c})`, kb.clauses);
+
+    if (not_w && !kb.not_wumpus.includes(k)) {
+        kb.not_wumpus.push(k);
+        add_clause(kb, [`~WUMPUS(${r},${c})`]);
+    }
+    if (not_p && !kb.not_pit.includes(k)) {
+        kb.not_pit.push(k);
+        add_clause(kb, [`~PIT(${r},${c})`]);
+    }
+
+    if (not_w && not_p && !kb.safe.includes(k)) {
+        kb.safe.push(k);
+        add_clause(kb, [`SAFE(${r},${c})`]);
+        const msg = `KB ⊢ SAFE(${r},${c}) proved by resolution`;
+        kb.resolved_log.push(msg);
+        state.log.push({ msg, type: "ok" });
+    }
+
+    confirm_wumpus(state);
+    confirm_pits(state);
+}
+
+function confirm_wumpus(state) {
+    const kb = state.kb;
+    const { rows, cols } = state;
+    if (!state.wumpus_alive || kb.stenches.length === 0) return;
+    const candidates = [];
+    for (let r=0; r<rows; r++) {
+        for (let c=0; c<cols; c++) {
+            const k = key(r,c);
+            if (!kb.not_wumpus.includes(k) && !kb.wumpus_confirmed.includes(k)) {
+                candidates.push(k);
+            }
+        }
+    }
+    if (candidates.length === 1) {
+        const k = candidates[0];
+        kb.wumpus_confirmed.push(k);
+        const [r2, c2] = unkey(k);
+        add_clause(kb, [`WUMPUS(${r2},${c2})`]);
+        const msg = `KB ⊢ BEAST confirmed at (${r2},${c2})`;
+        kb.resolved_log.push(msg);
+        state.log.push({ msg, type: "warn" });
+    }
+}
+
+function confirm_pits(state) {
+    const kb = state.kb;
+    const { rows, cols } = state;
+    for (let bk of kb.breezes) {
+        const [br, bc] = unkey(bk);
+        const nbrs = neighbors(br, bc, rows, cols);
+        const possible = nbrs.filter(([nr, nc]) => {
+            const k = key(nr, nc);
+            return !kb.not_pit.includes(k) && !kb.pit_confirmed.includes(k);
+        });
+        if (possible.length === 1) {
+            const [pr, pc] = possible[0];
+            const pk = key(pr, pc);
+            if (!kb.pit_confirmed.includes(pk)) {
+                kb.pit_confirmed.push(pk);
+                add_clause(kb, [`PIT(${pr},${pc})`]);
+                const msg = `KB ⊢ PIT confirmed at (${pr},${pc})`;
+                kb.resolved_log.push(msg);
+                state.log.push({ msg, type: "warn" });
+            }
+        }
+    }
+}
+
+function visit_cell(state, r, c) {
+    const kb = state.kb;
+    const k = key(r, c);
+    if (!kb.visited.includes(k)) kb.visited.push(k);
+    if (!kb.safe.includes(k)) kb.safe.push(k);
+    if (!kb.not_wumpus.includes(k)) kb.not_wumpus.push(k);
+    if (!kb.not_pit.includes(k)) kb.not_pit.push(k);
+    add_clause(kb, [`SAFE(${r},${c})`]);
+    add_clause(kb, [`~WUMPUS(${r},${c})`]);
+    add_clause(kb, [`~PIT(${r},${c})`]);
+    
+    for (let [nr, nc] of neighbors(r, c, state.rows, state.cols)) {
+        prove_cell(state, nr, nc);
+    }
+}
+
+function update_kb_after_wumpus_death(state, wr, wc) {
+    const kb = state.kb;
+    const { rows, cols } = state;
+    for (let r=0; r<rows; r++) {
+        for (let c=0; c<cols; c++) {
+            const k = key(r, c);
+            if (!kb.not_wumpus.includes(k)) kb.not_wumpus.push(k);
+            add_clause(kb, [`~WUMPUS(${r},${c})`]);
+            state.cells[k].stench = false;
+        }
+    }
+    kb.stenches = [];
+    for (let r=0; r<rows; r++) {
+        for (let c=0; c<cols; c++) {
+            prove_cell(state, r, c);
+        }
+    }
+}
+
+function bfs_path(state, sr, sc, tr, tc) {
+    const kb = state.kb;
+    const { rows, cols } = state;
+    if (sr === tr && sc === tc) return null;
+    const visited = new Set([key(sr, sc)]);
+    const queue = [[sr, sc, []]];
+    while (queue.length > 0) {
+        const [r, c, path] = queue.shift();
+        for (let [nr, nc] of neighbors(r, c, rows, cols)) {
+            const k = key(nr, nc);
+            if (visited.has(k) || !kb.safe.includes(k)) continue;
+            visited.add(k);
+            const new_path = [...path, [nr, nc]];
+            if (nr === tr && nc === tc) return new_path[0];
+            queue.push([nr, nc, new_path]);
+        }
+    }
+    return null;
+}
+
+function get_safe_frontier(state) {
+    const kb = state.kb;
+    const { rows, cols } = state;
+    const frontier = [];
+    for (let r=0; r<rows; r++) {
+        for (let c=0; c<cols; c++) {
+            const k = key(r, c);
+            if (kb.safe.includes(k) && !kb.visited.includes(k)) {
+                frontier.push([r, c]);
+            }
+        }
+    }
+    return frontier.reverse();
+}
+
+function shuffleArray(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+}
+
+function choose_move(state) {
+    const { agent, kb, rows, cols } = state;
+    const { r, c } = agent;
+    if (agent.has_gold) return bfs_path(state, r, c, 0, 0);
+
+    let safe_unvisited = neighbors(r, c, rows, cols).filter(([nr, nc]) => {
+        const k = key(nr, nc);
+        return kb.safe.includes(k) && !kb.visited.includes(k);
+    });
+    if (safe_unvisited.length > 0) {
+        shuffleArray(safe_unvisited);
+        return safe_unvisited[0];
+    }
+
+    let frontier = get_safe_frontier(state);
+    shuffleArray(frontier);
+    for (let [tr, tc] of frontier) {
+        const step = bfs_path(state, r, c, tr, tc);
+        if (step) return step;
+    }
+    return null;
+}
+
+function do_step_logic(state) {
+    if (state.game_over || !state.initialized) return state;
+
+    const { agent, kb, rows, cols } = state;
+    const r = agent.r, c = agent.c;
+    state.steps++;
+    state.score--;
+
+    if (state.cells[key(r, c)].glitter && !agent.has_gold) {
+        agent.has_gold = true;
+        state.cells[key(r, c)].glitter = false;
+        state.cells[key(r, c)].gold = false;
+        state.gold_found = true;
+        state.score += 1000;
+        state.log.push({ msg: "🏆 TREASURE SECURED! +1000", type: "ok" });
+    }
+
+    if (agent.has_gold && r === 0 && c === 0) {
+        state.game_over = true;
+        state.result = "win";
+        state.log.push({ msg: "🎉 MISSION COMPLETE! Agent escaped with treasure!", type: "ok" });
+        return state;
+    }
+
+    if (state.wumpus_alive && agent.has_arrow && kb.wumpus_confirmed.length > 0) {
+        const [wr, wc] = unkey(kb.wumpus_confirmed[0]);
+        const nbrs = neighbors(r, c, rows, cols);
+        if (nbrs.some(([nr, nc]) => nr === wr && nc === wc)) {
+            agent.has_arrow = false;
+            state.score -= 10;
+            state.wumpus_alive = false;
+            state.cells[key(wr, wc)].wumpus = false;
+            state.log.push({ msg: `🏹 Arrow fired! BEAST at (${wr},${wc}) ELIMINATED!`, type: "warn" });
+            update_kb_after_wumpus_death(state, wr, wc);
+        }
+    }
+
+    const move = choose_move(state);
+    if (!move) {
+        state.game_over = true;
+        state.result = "stuck";
+        state.log.push({ msg: "⚠ No safe moves available. Agent halted.", type: "err" });
+        return state;
+    }
+
+    const [nr, nc] = move;
+    agent.r = nr; agent.c = nc;
+    state.log.push({ msg: `→ MOVE to (${nr},${nc})`, type: "step" });
+
+    const cell = state.cells[key(nr, nc)];
+    if (cell.pit) {
+        agent.alive = false;
+        state.score -= 1000;
+        state.game_over = true;
+        state.result = "death";
+        state.log.push({ msg: `💀 Fell into PIT at (${nr},${nc})!`, type: "err" });
+        return state;
+    }
+    if (cell.wumpus && state.wumpus_alive) {
+        agent.alive = false;
+        state.score -= 1000;
+        state.game_over = true;
+        state.result = "death";
+        state.log.push({ msg: `💀 Devoured by BEAST at (${nr},${nc})!`, type: "err" });
+        return state;
+    }
+
+    encode_percepts(state, nr, nc);
+
+    const percepts = [];
+    if (cell.stench) percepts.push("STENCH");
+    if (cell.breeze) percepts.push("BREEZE");
+    if (cell.glitter) percepts.push("GLITTER");
+    if (percepts.length === 0) percepts.push("NONE");
+    state.log.push({ msg: `PERCEPT@(${nr},${nc}): [${percepts.join(', ')}]`, type: "info" });
+
+    visit_cell(state, nr, nc);
+    return state;
+}
+
+function apiInitLocal(r, c, p) {
+    const state = make_fresh_state(r, c, p);
+    encode_percepts(state, 0, 0);
+    visit_cell(state, 0, 0);
+
+    const cell = state.cells[key(0, 0)];
+    const percepts = [];
+    if (cell.stench) percepts.push("STENCH");
+    if (cell.breeze) percepts.push("BREEZE");
+    if (cell.glitter) percepts.push("GLITTER");
+    if (percepts.length === 0) percepts.push("NONE");
+
+    state.log.unshift({ msg: `PERCEPT@(0,0): [${percepts.join(', ')}]`, type: "info" });
+    state.log.unshift({ msg: `Dungeon ${r}×${c} initialized. Pit traps: ${p}`, type: "info" });
+    
+    return state;
+}
+// ------------------------------------------
+async function apiInit() { const r = +document.getElementById('rows').value, c = +document.getElementById('cols').value, p = +document.getElementById('pits').value; return apiInitLocal(r, c, p); }
+    async function apiStep() { return do_step_logic(STATE); }
     function renderGrid(state) { const rows = state.rows, cols = state.cols; const wrapW = document.getElementById('grid-area').clientWidth - 60; const wrapH = document.getElementById('grid-area').clientHeight - 84; const maxSz = Math.min(Math.floor(wrapW / cols), Math.floor(wrapH / rows), 92); const cellSz = Math.max(maxSz, 48); const kb = state.kb, agent = state.agent; let html = `<div id="grid" style="grid-template-columns:repeat(${cols},${cellSz}px)">`; for (let r = rows - 1; r >= 0; r--) { for (let c = 0; c < cols; c++) { const k = `${r},${c}`; const cell = state.cells[k]; const isAgent = agent.r === r && agent.c === c; const isVisited = kb.visited.includes(k); const isSafe = kb.safe.includes(k); const isWC = kb.wumpus_confirmed.includes(k); const isPC = kb.pit_confirmed.includes(k); const hasStench = kb.stenches.includes(k) && isVisited; const hasBreeze = kb.breezes.includes(k) && isVisited; let cls = 'cell'; if (isAgent) cls += ' cell-agent'; if (isWC) cls += ' cell-wumpus'; else if (isPC) cls += ' cell-pit'; else if (isVisited) cls += ' cell-visited'; else if (isSafe) cls += ' cell-safe'; else cls += ' cell-unknown'; if (hasStench) cls += ' has-stench'; if (hasBreeze) cls += ' has-breeze'; let icons = ''; if (isAgent) icons += agent.alive ? '🤖' : '💀'; if (!isVisited) { if (isWC) icons += '👹'; else if (isPC) icons += '🕳️'; else if (isSafe) icons += '<span style="font-size:14px;color:var(--safe)">✓</span>'; else icons += '<span style="font-size:14px;color:var(--dim)">?</span>'; } else { if (hasStench) icons += '<span style="font-size:13px">🔥</span>'; if (hasBreeze) icons += '<span style="font-size:13px">🌬️</span>'; if (cell.glitter || cell.gold) icons += '⭐'; } let badge = ''; if (!isVisited) { if (isWC) badge = `<div class="cell-badge" style="color:var(--danger)">W!</div>`; else if (isPC) badge = `<div class="cell-badge" style="color:var(--pit)">P!</div>`; else if (isSafe) badge = `<div class="cell-badge" style="color:var(--safe)">OK</div>`; } html += `<div class="${cls}" style="width:${cellSz}px;height:${cellSz}px" title="${r},${c}"><div class="cell-coord">${r},${c}</div><div class="cell-icons">${icons}</div>${badge}</div>`; } } html += '</div>'; document.getElementById('grid-container').innerHTML = html; }
     function applyState(state) { STATE = state; renderGrid(state); document.getElementById('v-steps').textContent = state.steps; document.getElementById('v-score').textContent = state.score; document.getElementById('v-kb').textContent = state.kb.clauses.length; const a = state.agent; document.getElementById('sb-pos').textContent = `(${a.r},${a.c})`; document.getElementById('sb-arrow').textContent = a.has_arrow ? '✓ Ready' : '✗ Used'; document.getElementById('sb-gold').textContent = a.has_gold ? '✓ Secured' : '✗ None'; document.getElementById('sb-wumpus').textContent = state.wumpus_alive ? '⚠ Roaming' : '✓ Eliminated'; const pct = Math.min((state.kb.clauses.length / MAX_CLAUSES) * 100, 100); document.getElementById('clause-bar').style.width = pct + '%'; document.getElementById('clause-bar').style.background = pct > 80 ? 'var(--danger)' : 'var(--accent)'; document.getElementById('clause-count').textContent = `${state.kb.clauses.length} / ${MAX_CLAUSES}`; const ul = document.getElementById('log-list'); ul.innerHTML = '';[...state.log].reverse().slice(0, 200).forEach((entry, i) => { const li = document.createElement('li'); li.className = entry.type; const step = String(state.steps - i).padStart(3, '0'); li.textContent = `[${step}] ${entry.msg}`; ul.appendChild(li); }); const safeTags = state.kb.safe.map(k => `<span class="kb-tag safe-tag">${k}</span>`).join('') || '—'; document.getElementById('kb-safe').innerHTML = safeTags; document.getElementById('kb-wumpus').innerHTML = state.kb.wumpus_confirmed.length ? state.kb.wumpus_confirmed.map(k => `<span class="kb-tag wump-tag">👹 ${k}</span>`).join(' ') : '<span style="color:var(--muted)">Not confirmed</span>'; document.getElementById('kb-pits').innerHTML = state.kb.pit_confirmed.length ? state.kb.pit_confirmed.map(k => `<span class="kb-tag pit-tag">🕳️ ${k}</span>`).join(' ') : '<span style="color:var(--muted)">Not confirmed</span>'; const proofs = state.kb.resolved_log; document.getElementById('kb-resolved').innerHTML = proofs.length ? proofs.map(p => `<div class="kb-proof">${p}</div>`).join('') : '<span style="color:var(--muted)">No proofs yet</span>'; const percepts = state.log.filter(e => e.msg && e.msg.startsWith('PERCEPT')); document.getElementById('percept-list').innerHTML = percepts.length ? percepts.reverse().map(p => { const msg = p.msg.replace('STENCH', '<span style="color:var(--danger)">STENCH</span>').replace('BREEZE', '<span style="color:#60a5fa">BREEZE</span>').replace('GLITTER', `<span style="color:var(--gold)">GLITTER</span>`).replace('NONE', `<span style="color:var(--dim)">NONE</span>`); return `<div class="perc-row">${msg}</div>`; }).join('') : '<div style="color:var(--muted);font-family:\'Space Mono\',monospace;font-size:9px;padding:8px;letter-spacing:1px">Awaiting sensor data...</div>'; if (state.game_over) { const win = state.result === 'win'; const stuck = state.result === 'stuck'; const pill = document.getElementById('agent-pill'); pill.textContent = win ? '◈ MISSION SUCCESS' : '◈ TERMINATED'; pill.className = win ? 'win' : 'dead'; document.getElementById('overlay-emoji').textContent = win ? '🏆' : (stuck ? '🚧' : '💀'); document.getElementById('overlay-title').textContent = win ? 'MISSION SUCCESS' : 'TERMINATED'; document.getElementById('overlay-title').style.color = win ? 'var(--gold)' : 'var(--danger)'; document.getElementById('overlay-sub').textContent = state.log[state.log.length - 1]?.msg || ''; document.getElementById('ovr-score').textContent = state.score; document.getElementById('ovr-steps').textContent = state.steps; document.getElementById('ovr-clauses').textContent = state.kb.clauses.length; if (!document.getElementById('overlay').classList.contains('show')) { saveHistory(state); } document.getElementById('overlay').classList.add('show'); stopAuto(); document.getElementById('btn-step').disabled = true; document.getElementById('btn-auto').disabled = true; } }
     function saveHistory(state) { const h = JSON.parse(localStorage.getItem('huntbot_history') || '[]'); const date = new Date().toLocaleString(); h.unshift({ result: state.result, score: state.score, steps: state.steps, date: date }); if (h.length > 50) h.pop(); localStorage.setItem('huntbot_history', JSON.stringify(h)); renderHistory(); }
